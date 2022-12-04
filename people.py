@@ -1,7 +1,8 @@
 import taichi as ti
-from astar_python import AStar
+from pre_astar import AStar
 from scene import Scene
 import utils
+import numpy as np
 
 @ti.data_oriented
 class People:
@@ -17,11 +18,18 @@ class People:
         self.forces = ti.Vector.field(2, ti.f32)
         self.desiredpos = ti.Vector.field(2, ti.f32)
         self.max_vel = ti.field(ti.f32, self.config.N)
-        self.vel_value = ti.field(ti.f32, self.config.N)
+        self.belong_batch = ti.field(ti.i8,self.config.N) # 每个人属于哪一组
         ti.root.dense(ti.i, self.config.N).place(
             self.vel, self.pos, self.desiredpos, self.forces)
             
         self.fill_parm()
+
+        self.color_list = ti.field(ti.i32,self.config.N)
+        self.triangle_X = ti.Vector.field(2, ti.f32) # 三个顶点
+        self.triangle_Y = ti.Vector.field(2, ti.f32)
+        self.triangle_Z = ti.Vector.field(2, ti.f32)
+        ti.root.dense(ti.i, self.config.N).place(self.triangle_X,self.triangle_Y,self.triangle_Z)
+
 
     def fill_parm(self):
         """init时调用的函数 实现numpy到taichi field的转换 初始化完成后的数据存访都使用taichi field"""
@@ -30,6 +38,12 @@ class People:
         self.desiredpos.from_numpy(self.config.desiredpos_0)
         self.max_vel.from_numpy(
             self.config.desiredvel * self.config.max_speed_factor)
+        # 填充每个人属于哪一组
+        group = []
+        for batch in range (self.config.batch):
+            group.append([batch] * self.config.group[batch])
+        self.belong_batch.from_numpy(np.hstack(np.array(group)))
+        print(self.belong_batch)
 
     def render(self, gui):
         """taichi gui渲染"""
@@ -39,38 +53,50 @@ class People:
         else:
             gui.set_image(self.config.im)
         
-        self.make_vel()
-        people_radius = self.vel_value.to_numpy()*self.config.people_radius
         people_centers = self.pos.to_numpy()
         sum = 0
         for i in range (self.config.batch): #分批渲染人
             _color=0x0000ff
             if i % 2 :
                 _color = 0x08ff08
-            gui.circles(people_centers[sum:sum+self.config.group[i],:],color= _color ,
-                    radius=people_radius[sum:sum+self.config.group[i]])
+            gui.circles(people_centers[sum:sum+self.config.group[i],:],color= _color,radius=self.config.people_radius)
             sum += self.config.group[i]
 
-    @ti.kernel
-    def make_vel(self):
-        """将人的速度大小转换为代表人的圆点的半径"""
-        for i in range(self.config.N):
-            self.vel_value[i] = self.vel[i].norm() + self.config.base_radius
-            if self.vel[i].norm() == 0:
-                print("my vel=0 now!,i=",i,"pos=",self.pos[i])
+        if self.config.leader_following_factor != 0 and self.config.steering_force == 1:
+            gui.circle(self.pos[i],color= 0x000000,radius=self.config.people_radius)
+
+        # 画三角形
+        self.make_triangle()
+        if self.config.draw_triangle == 1:
+            hex_color = self.color_list.to_numpy()
+            triangle_X = self.triangle_X.to_numpy()
+            triangle_Y = self.triangle_Y.to_numpy()
+            triangle_Z = self.triangle_Z.to_numpy()
+            gui.triangles(a=triangle_X, b=triangle_Y, c=triangle_Z,color=hex_color)
+
 
     @ti.kernel
-    def clean_forces(self):
+    def make_triangle(self):
+        """计算出三角形的顶点和颜色 三角形颜色深浅代表受力大小 方向为此刻合力方向"""
         for i in range(self.config.N):
-            self.forces[i] = ti.Vector([0.0, 0.0])
+            direction,value = utils.normalize(self.forces[i])
+            hex_color = utils.convert_data(value)  
+            self.color_list[i] = hex_color
+            X = self.pos[i] + direction * self.config.triangle_size * 1.2
+            self.triangle_X[i] = X
+            per_direction = ti.Vector([direction[1],-direction[0]])
+            X_back = self.pos[i] - direction * self.config.triangle_size * 0.8
+            self.triangle_Y[i] = X_back + per_direction * self.config.triangle_size *0.6
+            self.triangle_Z[i] = X_back - per_direction * self.config.triangle_size *0.6
 
     @ti.kernel
     def compute_desired_force(self):
         for i in range(self.config.N):
             if self.config.Astar == 1: #A*
                 _, dist = utils.normalize(self.desiredpos[i]-self.pos[i])
-                _pos = ti.floor(self.pos[i] * self.config.window_size , int)
-                direction = self.astar.map[_pos]
+                _pos2 = ti.floor(self.pos[i] * self.config.window_size , int)
+                _pos = int(_pos2[0] * self.config.window_size + _pos2[1])
+                direction = self.astar.map[self.belong_batch[i],_pos]
                 desired_force = ti.Vector([0.0, 0.0])
                 if dist > self.config.goal_threshold:
                     desired_force = direction * self.max_vel[i] - self.vel[i]
@@ -158,6 +184,7 @@ class People:
         """
         邻域更新+邻域搜索 主要分了静态分配内存(https://zhuanlan.zhihu.com/p/563182093)
         或者动态分配内存(使用dynamic node)的版本
+        其中静态分配内存在人群数量多的时候优势显著 (1w人 4FPS VS. 1.25FPS) 
         """
         self.scene.grid_count.fill(0)
         if self.config.dynamic_search == 0: # 静态分配内存
@@ -173,7 +200,7 @@ class People:
         """
         邻域搜索: 动态分配内存版本 
         地图网格化 对于每一个网格 更新fij和obstacle force
-        在9*9的邻域中搜索 时间复杂度O(N) N是地图中的格子数目
+        时间复杂度O(N) N是地图中的格子数目
         人与人之间的斥力和障碍物斥力都在邻域搜素中完成计算
         """
         for grid in range(self.config.pixel_number):
@@ -186,6 +213,10 @@ class People:
 
             for i in range(self.scene.grid_count[grid]):
                 current_people_index = self.scene.grid_matrix[grid,i]
+                flocking_count = 0
+                alignment_force = ti.Vector([0.0, 0.0])
+                separation_force = ti.Vector([0.0, 0.0])
+                cohesion_force = ti.Vector([0.0, 0.0])
                 for index_i in range(x_begin, x_end):
                     for index_j in range(y_begin, y_end):
                         index = int(index_i * self.config.window_size + index_j)
@@ -195,12 +226,22 @@ class People:
                             if current_people_index < other_people_index:
                                 self.compute_fij_force(current_people_index,other_people_index)
 
+                            if self.config.flocking == 1:
+                                dist = (self.pos[current_people_index] - self.pos[other_people_index]).norm()
+                                if current_people_index != other_people_index and dist < self.config.flocking_radius:
+                                    alignment_force += self.vel[other_people_index]
+                                    separation_force += (self.pos[current_people_index] - self.pos[other_people_index]) / dist
+                                    cohesion_force += self.pos[other_people_index]
+                                    flocking_count += 1
+                if self.config.flocking == 1 and flocking_count > 0:
+                    self.compute_flocking_force(current_people_index,alignment_force,separation_force,cohesion_force,flocking_count)
+
     @ti.kernel
     def search_grid_static(self):
         """
         邻域搜索: 静态分配内存版本 
         地图网格化 对于每一个网格 更新fij和obstacle force
-        在9*9的邻域中搜索 时间复杂度O(N) N是地图中的格子数目
+        时间复杂度O(N) N是地图中的格子数目
         人与人之间的斥力和障碍物斥力都在邻域搜素中完成计算
         """
         for i in range (self.config.N):
@@ -209,7 +250,10 @@ class People:
             x_end = min(grid_index[0] + self.config.search_radius+1, self.config.window_size)
             y_begin = max(grid_index[1] - self.config.search_radius, 0)
             y_end = min(grid_index[1] + self.config.search_radius+1, self.config.window_size)
-
+            flocking_count = 0
+            alignment_force = ti.Vector([0.0, 0.0])
+            separation_force = ti.Vector([0.0, 0.0])
+            cohesion_force = ti.Vector([0.0, 0.0])
             for index_i in range(x_begin, x_end):
                 for index_j in range(y_begin, y_end):
                     search_index = int(index_i * self.config.window_size + index_j)
@@ -218,7 +262,34 @@ class People:
                         j = self.scene.particle_id[p_idx]
                         if i < j:
                             self.compute_fij_force(i,j)
-                               
+                        if self.config.flocking == 1:
+                            dist = (self.pos[i] - self.pos[j]).norm()
+
+                            if i != j and dist < self.config.flocking_radius:
+                                alignment_force += self.vel[j]
+                                separation_force += (self.pos[i] - self.pos[j]) / dist
+                                cohesion_force += self.pos[j]
+                                flocking_count += 1
+            if self.config.flocking == 1 and flocking_count > 0:
+                self.compute_flocking_force(i,alignment_force,separation_force,cohesion_force,flocking_count)
+
+                        
+    @ti.func
+    def compute_flocking_force(self,i,alignment_force,separation_force,cohesion_force,flocking_count):
+        """计算flocking force"""
+        alignment = utils.limit(
+            utils.set_mag((alignment_force / flocking_count), self.max_vel[i]) - self.vel[i],
+            self.max_vel[i])
+        separation = utils.limit(
+            utils.set_mag((separation_force / flocking_count), self.max_vel[i]) - self.vel[i],
+            self.max_vel[i]) 
+        cohesion = utils.limit(
+            utils.set_mag(((cohesion_force / flocking_count) - self.pos[i]), self.max_vel[i]) -
+            self.vel[i], self.max_vel[i]) 
+
+        self.forces[i] += alignment * self.config.alignment_factor
+        self.forces[i] += separation * self.config.separation_factor
+        self.forces[i] += cohesion * self.config.cohesion_factor
 
     @ti.func
     def compute_fij_force(self,current_people_index,other_people_index):
@@ -250,8 +321,7 @@ class People:
             elif theta < 0:
                 sign_theta = -1.0
             force_angle_amount = -sign_theta * \
-                ti.exp(-1.0 * diff_length / B -
-                    (self.config.n * B * theta)**2)
+                ti.exp(-1.0 * diff_length / B -(self.config.n * B * theta)**2)
 
             force_velocity = force_velocity_amount * interaction_direction
             force_angle = ti.Vector([0.0, 0.0])
@@ -280,12 +350,59 @@ class People:
                 directions = directions * ti.exp(-dist / self.config.sigma)
                 self.forces[current_people_index] += directions*self.config.obstacle_factor
 
-    
+    @ti.kernel
+    def compute_steering_force(self):
+        flee_target = self.pos[0]
+        follower_target = self.calculate_follow_position()
+        for i in range(self.config.N):
+            # steering forces seek: pass through the target, and then turn back to approach again
+            seek_acc = utils.limit(
+                utils.set_mag((self.desiredpos[i]-self.pos[i]), self.max_vel[i]) - self.vel[i],
+                self.max_vel[i]) 
+
+            #flee forces:
+            flee_acc = utils.limit(
+                utils.set_mag((self.pos[i]-self.desiredpos[i]), self.max_vel[i]) - self.vel[i],
+                self.max_vel[i]) 
+
+            #arrival forces：
+            target_offset = self.desiredpos[i]-self.pos[i]
+            distance = target_offset.norm()
+            norm_desired_speed = utils.set_mag(target_offset,self.max_vel[i])
+            desired_speed = norm_desired_speed if distance >= self.config.slowing_distance else norm_desired_speed * distance / self.config.slowing_distance            
+            arrival_acc = (desired_speed - self.vel[i])
+
+            #leader following forces:
+            follower_acc = ti.Vector([0,0])
+            if (self.pos[i]-flee_target).norm() < self.config.behind_distance :
+                #flee forces:
+                follower_acc = utils.limit(
+                    utils.set_mag((self.pos[i]-flee_target), self.max_vel[i]) - self.vel[i],
+                    self.max_vel[i]) * self.config.flee_factor
+            else: 
+                target_offset = follower_target-self.pos[i]
+                distance = target_offset.norm()
+                norm_desired_speed = utils.set_mag(target_offset,self.max_vel[i])
+                desired_speed = norm_desired_speed if distance >= self.config.slowing_distance else norm_desired_speed * distance / self.config.slowing_distance
+                follower_acc = (desired_speed - self.vel[i])*15
+
+            if self.config.leader_following_factor != 0:
+                if i == 0:
+                    self.forces[i] += arrival_acc * self.config.arrival_factor
+                else:
+                    #对于跟随者
+                    self.forces[i] += follower_acc * self.config.leader_following_factor
+            else:
+                self.forces[i] += arrival_acc * self.config.arrival_factor
+                self.forces[i] += flee_acc * self.config.flee_factor
+                self.forces[i] += seek_acc * self.config.seek_factor  
 
     def make_force(self):
-        self.clean_forces()
+        self.forces.fill(0)
         self.update_grid() 
         self.compute_desired_force()
+        if self.config.steering_force == 1:
+            self.compute_steering_force()
 
     @ti.kernel
     def update(self):
@@ -303,4 +420,19 @@ class People:
             if self.pos[i][1] > 1 or self.pos[i][1] <0 :
                 print("out!!!!!,i=",i,self.pos[i])
 
+    @ti.kernel
+    def print_id(self,mouse_x:ti.f32,mouse_y:ti.f32):
+        mouse = ti.Vector([mouse_x,mouse_y])
+        for i in range(self.config.N):
+            diff = self.pos[i] - mouse
+            _,dist = utils.normalize(diff)
+            if (dist < 0.05):
+                print("selecting people:",self.pos[i],i)
 
+    @ti.func
+    def calculate_follow_position(self):
+        # assumes that only leader will trriger this function, so we take vel[0] and pos[0]
+        tv = -self.vel[0]
+        tv = tv / tv.norm() * self.config.behind_distance
+        behind = self.pos[0] + tv
+        return behind

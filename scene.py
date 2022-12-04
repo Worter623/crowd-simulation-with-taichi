@@ -35,9 +35,10 @@ class Scene:
         else:
             self.init_from_pic(config)
         self.make_obstacle_pos()
-
+        
         #for pure python version
         self.obstacle = self.obstacle_exist.to_numpy()
+
 
 
     def init_obstacles(self, config):
