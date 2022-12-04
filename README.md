@@ -3,8 +3,6 @@ crowd simulation algorithms implemented with taichi
 
 a work for taichi hackathon
 
-
-
 ## 项目设计
 
 ### 选题背景
@@ -34,7 +32,7 @@ a work for taichi hackathon
   * 可通过参数指定：目前仅支持在配置中以(startx, starty, endx, endy)这样的四元组形式指定多条线段的起点、终点
   * 可传入图片指定：二值图片，如map文件夹中示例
 
-  <img src="README.assets/map maze.gif" alt="map maze" style="zoom: 50%;" />
+  <img src="./demo/map maze.gif" alt="map maze" style="zoom: 50%;" />
   
   <center><p>N=100, resolution = 65 ,social force + A*, in map maze </p></center>
 
@@ -70,8 +68,6 @@ a work for taichi hackathon
     <img src="./demo/export to UE-2.gif" width="300"/>
     <img src="./demo/src for UE.gif" width="300"/>
   </center>
-  
-  
   <center><p>N=100, resolution = 100, social force + A*,export to UE </p></center>
 
 ### 性能对比：
